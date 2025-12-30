@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from .._typed_dict import NotRequired, TypedDict
+from typing_extensions import NotRequired, TypedDict
 
 
 class EmbedFooter(TypedDict):
@@ -76,7 +76,14 @@ class EmbedAuthor(TypedDict, total=False):
 
 
 EmbedType = Literal[
-    "rich", "image", "video", "gifv", "article", "link", "auto_moderation_message"
+    "rich",
+    "image",
+    "video",
+    "gifv",
+    "article",
+    "link",
+    "auto_moderation_message",
+    "poll_result",
 ]
 
 

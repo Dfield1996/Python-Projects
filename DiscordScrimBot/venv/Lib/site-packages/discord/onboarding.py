@@ -24,16 +24,17 @@ DEALINGS IN THE SOFTWARE.
 
 from __future__ import annotations
 
+from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
 from .enums import OnboardingMode, PromptType, try_enum
 from .partial_emoji import PartialEmoji
-from .utils import MISSING, cached_property, generate_snowflake, get
+from .utils import MISSING, generate_snowflake, get
 
 if TYPE_CHECKING:
     from .abc import Snowflake
     from .channel import ForumChannel, TextChannel, VoiceChannel
-    from .emoji import Emoji
+    from .emoji import GuildEmoji
     from .guild import Guild
     from .object import Object
     from .partial_emoji import PartialEmoji
@@ -62,7 +63,7 @@ class PromptOption:
         The channels assigned to the user when they select this option.
     roles: List[:class:`Snowflake`]
         The roles assigned to the user when they select this option.
-    emoji: Union[:class:`Emoji`, :class:`PartialEmoji`]
+    emoji: Union[:class:`GuildEmoji`, :class:`PartialEmoji`]
         The emoji displayed with the option.
     title: :class:`str`
         The option's title.
@@ -76,7 +77,7 @@ class PromptOption:
         channels: list[Snowflake] | None = None,
         roles: list[Snowflake] | None = None,
         description: str | None = None,
-        emoji: Emoji | PartialEmoji | None = None,
+        emoji: GuildEmoji | PartialEmoji | None = None,
         id: int | None = None,
     ):
         # ID is required when making edits, but it can be any snowflake that isn't already used by another prompt during edits
@@ -85,7 +86,7 @@ class PromptOption:
         self.channels: list[Snowflake] = channels or []
         self.roles: list[Snowflake] = roles or []
         self.description: str | None = description or None
-        self.emoji: Emoji | PartialEmoji | None = emoji
+        self.emoji: GuildEmoji | PartialEmoji | None = emoji
 
     def __repr__(self):
         return f"<PromptOption id={self.id} title={self.title!r} description={self.description!r} emoji={self.emoji!r}>"

@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Player Availability</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { background: linear-gradient(135deg, #18181b 0%, #27272a 100%); }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: center; padding: 0.75rem; border: 1px solid #3f3f46; cursor: pointer; transition: background 0.2s; }
+  th { background: linear-gradient(to right, #2563eb, #1d4ed8); color: white; }
+  td.available { background-color: #22c55e; color: white; }
+  td.unavailable { background-color: #ef4444; color: white; }
+  td:hover { filter: brightness(0.9); }
+</style>
+</head>
+<body class="text-white min-h-screen flex flex-col items-center p-6">
+
+<nav class="w-full px-6 py-4">
+  <div class="max-w-5xl mx-auto flex justify-center gap-4">
+    <a href="/scrims" class="px-4 py-2 rounded-lg shadow-lg bg-gradient-to-r from-blue-500 to-purple-600 text-white font-medium">Scrim Schedule</a>
+    <a href="/availability" class="px-4 py-2 rounded-lg shadow-lg bg-gradient-to-r from-blue-500 to-purple-600 text-white font-medium">Player Availability</a>
+  </div>
+</nav>
+
+<h1 class="text-5xl font-bold mb-6 bg-gradient-to-r from-orange-400 via-red-400 to-pink-600 bg-clip-text text-transparent">🗓 Player Availability</h1>
+
+<div class="mb-6 flex items-center gap-4">
+  <label class="text-zinc-300 font-medium">Week:</label>
+  <select id="week" class="bg-zinc-700/50 text-white border border-zinc-600 rounded-lg p-2"></select>
+
+  <label class="text-zinc-300 font-medium">Player:</label>
+  <select id="player" class="bg-zinc-700/50 text-white border border-zinc-600 rounded-lg p-2"></select>
+
+  <button id="edit-players-btn" class="ml-4 px-4 py-2 bg-gradient-to-r from-yellow-500 to-orange-600 rounded-lg font-medium shadow-md hover:shadow-lg transition-all">Edit Players</button>
+</div>
+
+<table id="schedule" class="max-w-5xl text-white">
+  <thead>
+    <tr>
+      <th>Time</th>
+      <th id="day0">Monday</th>
+      <th id="day1">Tuesday</th>
+      <th id="day2">Wednesday</th>
+      <th id="day3">Thursday</th>
+      <th id="day4">Friday</th>
+      <th id="day5">Saturday</th>
+      <th id="day6">Sunday</th>
+    </tr>
+  </thead>
+  <tbody></tbody>
+</table>
+
+<div id="edit-players-modal" class="hidden fixed inset-0 bg-black/50 flex items-center justify-center">
+  <div class="bg-zinc-800 p-6 rounded-lg max-w-sm w-full">
+    <h2 class="text-xl font-bold mb-4 text-white">Edit Players</h2>
+    <div id="player-inputs" class="flex flex-col gap-2"></div>
+    <div class="mt-4 flex justify-end gap-2">
+      <button onclick="closePlayerModal()" class="px-3 py-1 bg-red-600 rounded text-white">Cancel</button>
+      <button onclick="savePlayerNames()" class="px-3 py-1 bg-green-600 rounded text-white">Save</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const DAYS = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"];
+const weekSelect = document.getElementById('week');
+const playerSelect = document.getElementById('player');
+const addForm = document.getElementById('addForm'); 
+const addMsg = document.getElementById('addMsg');   
+
+let players = [];
+
+// --- Initialize week dropdown ---
+function initWeekSelect() {
+    const today = new Date();
+    for (let offset = -1; offset <= 1; offset++) {
+        const monday = new Date(today);
+        monday.setDate(monday.getDate() + offset*7 - monday.getDay() + 1);
+        const sunday = new Date(monday);
+        sunday.setDate(sunday.getDate() + 6);
+        const formatDate = d => `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`;
+        const label = `${formatDate(monday)} - ${formatDate(sunday)}`;
+        const opt = document.createElement('option');
+        opt.value = offset;
+        opt.textContent = label;
+        if(offset===0) opt.selected = true;
+        weekSelect.appendChild(opt);
+    }
+}
+
+// --- Load players from backend ---
+async function loadPlayers() {
+    try {
+        const res = await fetch('/api/players');
+        if (!res.ok) throw new Error(`Failed to fetch players: ${res.status}`);
+        players = await res.json();
+
+        playerSelect.innerHTML = '';
+        players.forEach(player => {
+            const opt = document.createElement('option');
+            opt.value = player.id;
+            opt.textContent = player.name;
+            playerSelect.appendChild(opt);
+        });
+
+        if(players.length > 0) playerSelect.value = players[0].id;
+
+    } catch (err) {
+        console.error("Error loading players:", err);
+    }
+}
+
+// --- Build schedule grid ---
+function buildScheduleGrid() {
+    const tbody = document.querySelector('#schedule tbody');
+    tbody.innerHTML = '';
+    const times = ["6PM","7PM","8PM","9PM","10PM","11PM","12AM"];
+    times.forEach(time => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${time}</td>` + "<td class='slot'></td>".repeat(7);
+        tbody.appendChild(tr);
+    });
+}
+
+// --- Load availability ---
+async function loadAvailability() {
+    const player_id = parseInt(playerSelect.value);
+    const week_offset = parseInt(weekSelect.value);
+    if(isNaN(player_id)) return;
+
+    const res = await fetch(`/api/availability?player_id=${player_id}&week_offset=${week_offset}`);
+    if(!res.ok) return;
+    const data = await res.json();
+
+    // Update day headers
+    const today = new Date();
+    const monday = new Date(today);
+    monday.setDate(monday.getDate() + week_offset*7 - monday.getDay() + 1);
+    for(let i=0;i<7;i++){
+        const d = new Date(monday);
+        d.setDate(d.getDate() + i);
+        document.getElementById(`day${i}`).textContent = `${DAYS[i]} ${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`;
+    }
+
+    // Fill table
+    const tbody = document.querySelector('#schedule tbody');
+    tbody.querySelectorAll('td.slot').forEach(td => td.classList.remove('available', 'unavailable'));
+
+    Object.entries(data).forEach(([fullDay, times]) => {
+        const dayName = fullDay.split(' ')[0];
+        const col = DAYS.indexOf(dayName);
+        if(col===-1) return;
+
+        Object.entries(times).forEach(([time, status]) => {
+            const row = [...tbody.rows].find(r => r.cells[0].textContent===time);
+            if(!row) return;
+            row.cells[col+1].classList.remove('available','unavailable');
+            if(status==='available') row.cells[col+1].classList.add('available');
+            else if(status==='unavailable') row.cells[col+1].classList.add('unavailable');
+        });
+    });
+}
+
+// --- Handle slot clicks ---
+document.getElementById('schedule').addEventListener('click', async e => {
+    if(!e.target.classList.contains('slot')) return;
+    const td = e.target;
+    const player_id = parseInt(playerSelect.value);
+    const col = td.cellIndex-1;
+    const day = DAYS[col];
+    const time = td.parentElement.cells[0].textContent;
+    const week_offset = parseInt(weekSelect.value);
+
+    if(!td.classList.contains('available') && !td.classList.contains('unavailable')) td.classList.add('available');
+    else if(td.classList.contains('available')) { td.classList.remove('available'); td.classList.add('unavailable'); }
+    else td.classList.remove('unavailable');
+
+    const status = td.classList.contains('available') ? 'available' : td.classList.contains('unavailable') ? 'unavailable' : 'none';
+
+    await fetch('/api/availability', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({player_id, day, time, status, week_offset})
+    });
+});
+
+// --- Dropdown change events ---
+playerSelect.addEventListener('change', loadAvailability);
+weekSelect.addEventListener('change', loadAvailability);
+
+// --- Edit players modal logic ---
+const editBtn = document.getElementById('edit-players-btn');
+const modal = document.getElementById('edit-players-modal');
+const playerInputsDiv = document.getElementById('player-inputs');
+
+editBtn.addEventListener('click', () => {
+    playerInputsDiv.innerHTML = '';
+    players.forEach(player => {
+        const input = document.createElement('input');
+        input.value = player.name;
+        input.dataset.id = player.id;
+        input.className = 'p-2 rounded bg-zinc-700 text-white';
+        playerInputsDiv.appendChild(input);
+    });
+    modal.classList.remove('hidden');
+});
+
+function closePlayerModal() {
+    modal.classList.add('hidden');
+}
+
+async function savePlayerNames() {
+    const inputs = playerInputsDiv.querySelectorAll('input');
+    const changedPlayers = [];
+
+    inputs.forEach(input => {
+        const newName = input.value.trim();
+        const player = players.find(p => p.id == input.dataset.id);
+        if (player && newName !== player.name) changedPlayers.push({id: input.dataset.id, name: newName});
+    });
+
+    for (const p of changedPlayers) {
+        await fetch('/api/player', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({id: p.id, name: p.name})
+        });
+    }
+
+    await loadPlayers();
+    closePlayerModal();
+}
+
+
+
+// --- Init ---
+(async function init(){
+    await loadPlayers();
+    initWeekSelect();
+    buildScheduleGrid();
+    await loadAvailability();
+})();
+
+
+
+</script>
+</body>
+</html>

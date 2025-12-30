@@ -39,9 +39,11 @@ from .activity import ActivityTypes, create_activity
 from .asset import Asset
 from .colour import Colour
 from .enums import Status, try_enum
+from .errors import InvalidArgument
 from .flags import MemberFlags
 from .object import Object
 from .permissions import Permissions
+from .primary_guild import PrimaryGuild
 from .user import BaseUser, User, _UserTag
 from .utils import MISSING
 
@@ -288,6 +290,7 @@ class Member(discord.abc.Messageable, _UserTag):
         "_user",
         "_state",
         "_avatar",
+        "_banner",
         "communication_disabled_until",
         "flags",
     )
@@ -309,6 +312,7 @@ class Member(discord.abc.Messageable, _UserTag):
         accent_color: Colour | None
         accent_colour: Colour | None
         communication_disabled_until: datetime.datetime | None
+        primary_guild: PrimaryGuild | None
 
     def __init__(
         self, *, data: MemberWithUserPayload, guild: Guild, state: ConnectionState
@@ -328,6 +332,7 @@ class Member(discord.abc.Messageable, _UserTag):
         self.nick: str | None = data.get("nick", None)
         self.pending: bool = data.get("pending", False)
         self._avatar: str | None = data.get("avatar")
+        self._banner: str | None = data.get("banner")
         self.communication_disabled_until: datetime.datetime | None = utils.parse_time(
             data.get("communication_disabled_until")
         )
@@ -406,6 +411,7 @@ class Member(discord.abc.Messageable, _UserTag):
         self.activities = member.activities
         self._state = member._state
         self._avatar = member._avatar
+        self._banner = member._banner
         self.communication_disabled_until = member.communication_disabled_until
         self.flags = member.flags
 
@@ -434,6 +440,7 @@ class Member(discord.abc.Messageable, _UserTag):
         self.premium_since = utils.parse_time(data.get("premium_since"))
         self._roles = utils.SnowflakeList(map(int, data["roles"]))
         self._avatar = data.get("avatar")
+        self._banner = data.get("banner")
         self.communication_disabled_until = utils.parse_time(
             data.get("communication_disabled_until")
         )
@@ -444,7 +451,8 @@ class Member(discord.abc.Messageable, _UserTag):
     ) -> tuple[User, User] | None:
         self.activities = tuple(map(create_activity, data["activities"]))
         self._client_status = {
-            sys.intern(key): sys.intern(value) for key, value in data.get("client_status", {}).items()  # type: ignore
+            sys.intern(key): sys.intern(value)
+            for key, value in data.get("client_status", {}).items()  # type: ignore
         }
         self._client_status[None] = sys.intern(data["status"])
 
@@ -562,7 +570,8 @@ class Member(discord.abc.Messageable, _UserTag):
             role = g.get_role(role_id)
             if role:
                 result.append(role)
-        result.append(g.default_role)
+        if g.default_role:
+            result.append(g.default_role)
         result.sort()
         return result
 
@@ -601,6 +610,31 @@ class Member(discord.abc.Messageable, _UserTag):
             return None
         return Asset._from_guild_avatar(
             self._state, self.guild.id, self.id, self._avatar
+        )
+
+    @property
+    def display_banner(self) -> Asset | None:
+        """Returns the member's display banner.
+
+        For regular members this is just their banner, but
+        if they have a guild specific banner then that
+        is returned instead.
+
+        .. versionadded:: 2.7
+        """
+        return self.guild_banner or self._user.banner
+
+    @property
+    def guild_banner(self) -> Asset | None:
+        """Returns an :class:`Asset` for the guild banner
+        the member has. If unavailable, ``None`` is returned.
+
+        .. versionadded:: 2.7
+        """
+        if self._banner is None:
+            return None
+        return Asset._from_guild_banner(
+            self._state, self.guild.id, self.id, self._banner
         )
 
     @property
@@ -739,6 +773,9 @@ class Member(discord.abc.Messageable, _UserTag):
         reason: str | None = None,
         communication_disabled_until: datetime.datetime | None = MISSING,
         bypass_verification: bool | None = MISSING,
+        banner: bytes | None = MISSING,
+        avatar: bytes | None = MISSING,
+        bio: str | None = MISSING,
     ) -> Member | None:
         """|coro|
 
@@ -773,6 +810,14 @@ class Member(discord.abc.Messageable, _UserTag):
             - Client has :attr:`Permissions.manage_roles`
 
             - Client has ALL THREE of :attr:`Permissions.moderate_members`, :attr:`Permissions.kick_members`, and :attr:`Permissions.ban_members`
+
+        .. note::
+
+            The following parameters are only available when editing the bot's own member:
+
+            - ``avatar``
+            - ``banner``
+            - ``bio``
 
         All parameters are optional.
 
@@ -811,6 +856,26 @@ class Member(discord.abc.Messageable, _UserTag):
             Indicates if the member should bypass the guild's verification requirements.
 
             .. versionadded:: 2.6
+        banner: Optional[:class:`bytes`]
+            A :term:`py:bytes-like object` representing the banner.
+            Could be ``None`` to denote removal of the banner.
+
+            This is only available when editing the bot's own member (i.e. :attr:`Guild.me`).
+
+            .. versionadded:: 2.7
+        avatar: Optional[:class:`bytes`]
+            A :term:`py:bytes-like object` representing the avatar.
+            Could be ``None`` to denote removal of the avatar.
+
+            This is only available when editing the bot's own member (i.e. :attr:`Guild.me`).
+
+            .. versionadded:: 2.7
+        bio: Optional[:class:`str`]
+            The new bio for the member. Could be ``None`` to denote removal of the bio.
+
+            This is only available when editing the bot's own member (i.e. :attr:`Guild.me`).
+
+            .. versionadded:: 2.7
 
         Returns
         -------
@@ -824,16 +889,19 @@ class Member(discord.abc.Messageable, _UserTag):
             You do not have the proper permissions to the action requested.
         HTTPException
             The operation failed.
+        InvalidArgument
+            You tried to edit the avatar, banner, or bio of a member that is not the bot.
         """
         http = self._state.http
         guild_id = self.guild.id
         me = self._state.self_id == self.id
         payload: dict[str, Any] = {}
+        bot_payload: dict[str, Any] = {}
 
         if nick is not MISSING:
             nick = nick or ""
             if me:
-                await http.change_my_nickname(guild_id, nick, reason=reason)
+                bot_payload["nick"] = nick
             else:
                 payload["nick"] = nick
 
@@ -880,9 +948,34 @@ class Member(discord.abc.Messageable, _UserTag):
             flags.bypasses_verification = bypass_verification
             payload["flags"] = flags.value
 
+        if avatar is not MISSING:
+            if avatar is None:
+                bot_payload["avatar"] = None
+            else:
+                bot_payload["avatar"] = utils._bytes_to_base64_data(avatar)
+
+        if banner is not MISSING:
+            if banner is None:
+                bot_payload["banner"] = None
+            else:
+                bot_payload["banner"] = utils._bytes_to_base64_data(banner)
+
+        if bio is not MISSING:
+            bot_payload["bio"] = bio or ""
+
+        if bot_payload and not me:
+            raise InvalidArgument(
+                "Can only edit avatar, banner, or bio for the bot's member."
+            )
+
         if payload:
             data = await http.edit_member(guild_id, self.id, reason=reason, **payload)
-            return Member(data=data, guild=self.guild, state=self._state)
+        elif bot_payload:
+            data = await http.edit_member(guild_id, "@me", reason=reason, **bot_payload)
+        else:
+            return None
+
+        return Member(data=data, guild=self.guild, state=self._state)
 
     async def timeout(
         self, until: datetime.datetime | None, *, reason: str | None = None

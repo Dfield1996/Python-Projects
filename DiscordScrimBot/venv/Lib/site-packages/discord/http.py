@@ -29,7 +29,15 @@ import asyncio
 import logging
 import sys
 import weakref
-from typing import TYPE_CHECKING, Any, Coroutine, Iterable, Sequence, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncGenerator,
+    Coroutine,
+    Iterable,
+    Sequence,
+    TypeVar,
+)
 from urllib.parse import quote as _uriquote
 
 import aiohttp
@@ -44,8 +52,10 @@ from .errors import (
     LoginFailure,
     NotFound,
 )
+from .file import VoiceMessage
 from .gateway import DiscordClientWebSocketResponse
-from .utils import MISSING, warn_deprecated
+from .soundboard import PartialSoundboardSound, SoundboardSound
+from .utils import MISSING
 
 _log = logging.getLogger(__name__)
 
@@ -83,6 +93,7 @@ if TYPE_CHECKING:
         widget,
     )
     from .types.snowflake import Snowflake, SnowflakeList
+    from .types.soundboard import SoundboardSound as SoundboardSoundPayload
 
     T = TypeVar("T")
     BE = TypeVar("BE", bound=BaseException)
@@ -105,6 +116,8 @@ async def json_or_text(response: aiohttp.ClientResponse) -> dict[str, Any] | str
 
 
 class Route:
+    API_BASE_URL: str = "https://discord.com/api/v{API_VERSION}"
+
     def __init__(self, method: str, path: str, **parameters: Any) -> None:
         self.path: str = path
         self.method: str = method
@@ -126,7 +139,7 @@ class Route:
 
     @property
     def base(self) -> str:
-        return f"https://discord.com/api/v{API_VERSION}"
+        return self.API_BASE_URL.format(API_VERSION=API_VERSION)
 
     @property
     def bucket(self) -> str:
@@ -401,6 +414,21 @@ class HTTPClient:
             else:
                 raise HTTPException(resp, "failed to get asset")
 
+    async def stream_from_cdn(self, url: str, chunksize: int) -> AsyncGenerator[bytes]:
+        if not isinstance(chunksize, int) or chunksize < 1:
+            raise InvalidArgument("The chunksize must be a positive integer.")
+
+        async with self.__session.get(url) as resp:
+            if resp.status == 200:
+                async for chunk in resp.content.iter_chunked(chunksize):
+                    yield chunk
+            elif resp.status == 404:
+                raise NotFound(resp, "asset not found")
+            elif resp.status == 403:
+                raise Forbidden(resp, "cannot retrieve asset")
+            else:
+                raise HTTPException(resp, "failed to get asset")
+
     # state management
 
     async def close(self) -> None:
@@ -567,13 +595,17 @@ class HTTPClient:
         attachments = []
         form.append({"name": "payload_json"})
         for index, file in enumerate(files):
-            attachments.append(
-                {
-                    "id": index,
-                    "filename": file.filename,
-                    "description": file.description,
-                }
-            )
+            attachment_info = {
+                "id": index,
+                "filename": file.filename,
+                "description": file.description,
+            }
+            if isinstance(file, VoiceMessage):
+                attachment_info.update(
+                    waveform=file.waveform,
+                    duration_secs=file.duration_secs,
+                )
+            attachments.append(attachment_info)
             form.append(
                 {
                     "name": f"files[{index}]",
@@ -633,13 +665,17 @@ class HTTPClient:
         attachments = []
         form.append({"name": "payload_json"})
         for index, file in enumerate(files):
-            attachments.append(
-                {
-                    "id": index,
-                    "filename": file.filename,
-                    "description": file.description,
-                }
-            )
+            attachment_info = {
+                "id": index,
+                "filename": file.filename,
+                "description": file.description,
+            }
+            if isinstance(file, VoiceMessage):
+                attachment_info.update(
+                    waveform=file.waveform,
+                    duration_secs=file.duration_secs,
+                )
+            attachments.append(attachment_info)
             form.append(
                 {
                     "name": f"files[{index}]",
@@ -877,7 +913,7 @@ class HTTPClient:
     ) -> Response[None]:
         r = Route(
             "PUT",
-            "/channels/{channel_id}/pins/{message_id}",
+            "/channels/{channel_id}/messages/pins/{message_id}",
             channel_id=channel_id,
             message_id=message_id,
         )
@@ -888,13 +924,30 @@ class HTTPClient:
     ) -> Response[None]:
         r = Route(
             "DELETE",
-            "/channels/{channel_id}/pins/{message_id}",
+            "/channels/{channel_id}/messages/pins/{message_id}",
             channel_id=channel_id,
             message_id=message_id,
         )
         return self.request(r, reason=reason)
 
-    def pins_from(self, channel_id: Snowflake) -> Response[list[message.Message]]:
+    def pins_from(
+        self,
+        channel_id: Snowflake,
+        limit: int | None = None,
+        before: str | None = None,
+    ) -> Response[message.MessagePinPagination]:
+        r = Route("GET", "/channels/{channel_id}/messages/pins", channel_id=channel_id)
+        params = {}
+        if limit:
+            params["limit"] = limit
+        if before:
+            params["before"] = before
+
+        return self.request(r, params=params)
+
+    def legacy_pins_from(
+        self, channel_id: Snowflake
+    ) -> Response[list[message.Message]]:
         return self.request(
             Route("GET", "/channels/{channel_id}/pins", channel_id=channel_id)
         )
@@ -989,38 +1042,6 @@ class HTTPClient:
 
     def edit_profile(self, payload: dict[str, Any]) -> Response[user.User]:
         return self.request(Route("PATCH", "/users/@me"), json=payload)
-
-    def change_my_nickname(
-        self,
-        guild_id: Snowflake,
-        nickname: str,
-        *,
-        reason: str | None = None,
-    ) -> Response[member.Nickname]:
-        r = Route("PATCH", "/guilds/{guild_id}/members/@me", guild_id=guild_id)
-        payload = {
-            "nick": nickname,
-        }
-        return self.request(r, json=payload, reason=reason)
-
-    def change_nickname(
-        self,
-        guild_id: Snowflake,
-        user_id: Snowflake,
-        nickname: str,
-        *,
-        reason: str | None = None,
-    ) -> Response[member.Member]:
-        r = Route(
-            "PATCH",
-            "/guilds/{guild_id}/members/{user_id}",
-            guild_id=guild_id,
-            user_id=user_id,
-        )
-        payload = {
-            "nick": nickname,
-        }
-        return self.request(r, json=payload, reason=reason)
 
     def edit_my_voice_state(
         self, guild_id: Snowflake, payload: dict[str, Any]
@@ -1217,6 +1238,7 @@ class HTTPClient:
         allowed_mentions: message.AllowedMentions | None = None,
         stickers: list[sticker.StickerItem] | None = None,
         components: list[components.Component] | None = None,
+        flags: int | None = None,
     ) -> Response[threads.Thread]:
         payload: dict[str, Any] = {
             "name": name,
@@ -1252,6 +1274,9 @@ class HTTPClient:
 
         if stickers:
             message["sticker_ids"] = stickers
+
+        if flags:
+            message["flags"] = flags
 
         if message != {}:
             payload["message"] = message
@@ -1445,6 +1470,7 @@ class HTTPClient:
         limit: int,
         before: Snowflake | None = None,
         after: Snowflake | None = None,
+        with_counts: bool = True,
     ) -> Response[list[guild.Guild]]:
         params: dict[str, Any] = {
             "limit": limit,
@@ -1454,6 +1480,8 @@ class HTTPClient:
             params["before"] = before
         if after:
             params["after"] = after
+        if with_counts:
+            params["with_counts"] = int(with_counts)
 
         return self.request(Route("GET", "/users/@me/guilds"), params=params)
 
@@ -1748,7 +1776,7 @@ class HTTPClient:
         initial_bytes = file.fp.read(16)
 
         try:
-            mime_type = utils._get_mime_type_for_image(initial_bytes)
+            mime_type = utils._get_mime_type_for_file(initial_bytes)
         except InvalidArgument:
             if initial_bytes.startswith(b"{"):
                 mime_type = "application/json"
@@ -1877,6 +1905,75 @@ class HTTPClient:
             emoji_id=emoji_id,
         )
         return self.request(r, json=payload, reason=reason)
+
+    def get_all_application_emojis(
+        self, application_id: Snowflake
+    ) -> Response[list[emoji.Emoji]]:
+        return self.request(
+            Route(
+                "GET",
+                "/applications/{application_id}/emojis",
+                application_id=application_id,
+            )
+        )
+
+    def get_application_emoji(
+        self, application_id: Snowflake, emoji_id: Snowflake
+    ) -> Response[emoji.Emoji]:
+        return self.request(
+            Route(
+                "GET",
+                "/applications/{application_id}/emojis/{emoji_id}",
+                application_id=application_id,
+                emoji_id=emoji_id,
+            )
+        )
+
+    def create_application_emoji(
+        self,
+        application_id: Snowflake,
+        name: str,
+        image: bytes,
+    ) -> Response[emoji.Emoji]:
+        payload = {
+            "name": name,
+            "image": image,
+        }
+
+        r = Route(
+            "POST",
+            "/applications/{application_id}/emojis",
+            application_id=application_id,
+        )
+        return self.request(r, json=payload)
+
+    def delete_application_emoji(
+        self,
+        application_id: Snowflake,
+        emoji_id: Snowflake,
+    ) -> Response[None]:
+        r = Route(
+            "DELETE",
+            "/applications/{application_id}/emojis/{emoji_id}",
+            application_id=application_id,
+            emoji_id=emoji_id,
+        )
+        return self.request(r)
+
+    def edit_application_emoji(
+        self,
+        application_id: Snowflake,
+        emoji_id: Snowflake,
+        *,
+        payload: dict[str, Any],
+    ) -> Response[emoji.Emoji]:
+        r = Route(
+            "PATCH",
+            "/applications/{application_id}/emojis/{emoji_id}",
+            application_id=application_id,
+            emoji_id=emoji_id,
+        )
+        return self.request(r, json=payload)
 
     def get_all_integrations(
         self, guild_id: Snowflake
@@ -2048,6 +2145,21 @@ class HTTPClient:
     def get_roles(self, guild_id: Snowflake) -> Response[list[role.Role]]:
         return self.request(Route("GET", "/guilds/{guild_id}/roles", guild_id=guild_id))
 
+    def get_roles_member_counts(self, guild_id: Snowflake) -> Response[dict[str, int]]:
+        return self.request(
+            Route("GET", "/guilds/{guild_id}/roles/member-counts", guild_id=guild_id)
+        )
+
+    def get_role(self, guild_id: Snowflake, role_id: Snowflake) -> Response[role.Role]:
+        return self.request(
+            Route(
+                "GET",
+                "/guilds/{guild_id}/roles/{role_id}",
+                guild_id=guild_id,
+                role_id=role_id,
+            )
+        )
+
     def edit_role(
         self,
         guild_id: Snowflake,
@@ -2066,6 +2178,7 @@ class HTTPClient:
             "name",
             "permissions",
             "color",
+            "colors",
             "hoist",
             "mentionable",
             "icon",
@@ -2933,7 +3046,7 @@ class HTTPClient:
         if user_id is not None:
             params["user_id"] = user_id
         if sku_ids is not None:
-            params["sku_ids"] = ",".join(sku_ids)
+            params["sku_ids"] = ",".join(str(sku_id) for sku_id in sku_ids)
         if before is not None:
             params["before"] = before
         if after is not None:
@@ -2990,6 +3103,43 @@ class HTTPClient:
         )
         return self.request(r)
 
+    def list_sku_subscriptions(
+        self,
+        sku_id: Snowflake,
+        *,
+        before: Snowflake | None = None,
+        after: Snowflake | None = None,
+        limit: int = 50,
+        user_id: Snowflake | None = None,
+    ) -> Response[list[monetization.Subscription]]:
+        params: dict[str, Any] = {}
+        if before is not None:
+            params["before"] = before
+        if after is not None:
+            params["after"] = after
+        if limit is not None:
+            params["limit"] = limit
+        if user_id is not None:
+            params["user_id"] = user_id
+        return self.request(
+            Route("GET", "/skus/{sku_id}/subscriptions", sku_id=sku_id),
+            params=params,
+        )
+
+    def get_subscription(
+        self,
+        sku_id: Snowflake,
+        subscription_id: Snowflake,
+    ) -> Response[monetization.Subscription]:
+        return self.request(
+            Route(
+                "GET",
+                "/skus/{sku_id}/subscriptions/{subscription_id}",
+                sku_id=sku_id,
+                subscription_id=subscription_id,
+            )
+        )
+
     # Onboarding
 
     def get_onboarding(self, guild_id: Snowflake) -> Response[onboarding.Onboarding]:
@@ -3009,6 +3159,19 @@ class HTTPClient:
         payload = {key: val for key, val in payload.items() if key in keys}
         return self.request(
             Route("PUT", "/guilds/{guild_id}/onboarding", guild_id=guild_id),
+            json=payload,
+            reason=reason,
+        )
+
+    def modify_guild_incident_actions(
+        self,
+        guild_id: Snowflake,
+        payload: guild.ModifyIncidents,
+        *,
+        reason: str | None = None,
+    ) -> Response[guild.IncidentsData]:
+        return self.request(
+            Route("PUT", "/guilds/{guild_id}/incident-actions", guild_id=guild_id),
             json=payload,
             reason=reason,
         )
@@ -3093,3 +3256,98 @@ class HTTPClient:
 
     def get_user(self, user_id: Snowflake) -> Response[user.User]:
         return self.request(Route("GET", "/users/{user_id}", user_id=user_id))
+
+    def delete_sound(
+        self, sound: SoundboardSound, *, reason: str | None
+    ) -> Response[None]:
+        return self.request(
+            Route(
+                "DELETE",
+                "/guilds/{guild_id}/soundboard-sounds/{sound_id}",
+                guild_id=sound.guild.id,
+                sound_id=sound.id,
+            ),
+            reason=reason,
+        )
+
+    def get_default_sounds(self) -> Response[list[SoundboardSoundPayload]]:
+        return self.request(Route("GET", "/soundboard-default-sounds"))
+
+    def create_guild_sound(
+        self, guild_id: Snowflake, reason: str | None, **payload
+    ) -> Response[SoundboardSoundPayload]:
+        keys = (
+            "name",
+            "sound",
+            "volume",
+            "emoji_id",
+            "emoji_name",
+        )
+
+        payload = {k: v for k, v in payload.items() if k in keys and v is not None}
+
+        return self.request(
+            Route("POST", "/guilds/{guild_id}/soundboard-sounds", guild_id=guild_id),
+            json=payload,
+            reason=reason,
+        )
+
+    def get_all_guild_sounds(
+        self, guild_id: Snowflake
+    ) -> Response[list[SoundboardSoundPayload]]:
+        return self.request(
+            Route("GET", "/guilds/{guild_id}/soundboard-sounds", guild_id=guild_id)
+        )
+
+    def get_guild_sound(
+        self, guild_id: Snowflake, sound_id: Snowflake
+    ) -> Response[SoundboardSoundPayload]:
+        return self.request(
+            Route(
+                "GET",
+                "/guilds/{guild_id}/soundboard-sounds/{sound_id}",
+                guild_id=guild_id,
+                sound_id=sound_id,
+            )
+        )
+
+    def edit_guild_sound(
+        self, guild_id: Snowflake, sound_id: Snowflake, *, reason: str | None, **payload
+    ) -> Response[SoundboardSoundPayload]:
+        keys = (
+            "name",
+            "volume",
+            "emoji_id",
+            "emoji_name",
+        )
+
+        payload = {k: v for k, v in payload.items() if k in keys and v is not None}
+
+        return self.request(
+            Route(
+                "PATCH",
+                "/guilds/{guild_id}/soundboard-sounds/{sound_id}",
+                guild_id=guild_id,
+                sound_id=sound_id,
+            ),
+            json=payload,
+            reason=reason,
+        )
+
+    def send_soundboard_sound(
+        self, channel_id: int, sound: PartialSoundboardSound
+    ) -> Response[None]:
+        payload = {
+            "sound_id": sound.id,
+        }
+        if isinstance(sound, SoundboardSound) and not sound.is_default_sound:
+            payload["source_guild_id"] = sound.guild_id
+
+        return self.request(
+            Route(
+                "POST",
+                "/channels/{channel_id}/send-soundboard-sound",
+                channel_id=channel_id,
+            ),
+            json=payload,
+        )

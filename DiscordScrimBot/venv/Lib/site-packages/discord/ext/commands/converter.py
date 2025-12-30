@@ -41,6 +41,7 @@ from typing import (
 )
 
 import discord
+from discord.utils import UNICODE_EMOJIS
 
 from .errors import *
 
@@ -805,8 +806,8 @@ class GuildConverter(IDConverter[discord.Guild]):
         return result
 
 
-class EmojiConverter(IDConverter[discord.Emoji]):
-    """Converts to a :class:`~discord.Emoji`.
+class EmojiConverter(IDConverter[discord.GuildEmoji]):
+    """Converts to a :class:`~discord.GuildEmoji`.
 
     All lookups are done for the local guild first, if available. If that lookup
     fails, then it checks the client's global cache.
@@ -821,7 +822,7 @@ class EmojiConverter(IDConverter[discord.Emoji]):
          Raise :exc:`.EmojiNotFound` instead of generic :exc:`.BadArgument`
     """
 
-    async def convert(self, ctx: Context, argument: str) -> discord.Emoji:
+    async def convert(self, ctx: Context, argument: str) -> discord.GuildEmoji:
         match = self._get_id_match(argument) or re.match(
             r"<a?:\w{1,32}:([0-9]{15,20})>$", argument
         )
@@ -851,7 +852,8 @@ class EmojiConverter(IDConverter[discord.Emoji]):
 class PartialEmojiConverter(Converter[discord.PartialEmoji]):
     """Converts to a :class:`~discord.PartialEmoji`.
 
-    This is done by extracting the animated flag, name and ID from the emoji.
+    This is done by extracting the animated flag, name, and ID for custom emojis,
+    or by using the standard Unicode emojis supported by Discord.
 
     .. versionchanged:: 1.5
          Raise :exc:`.PartialEmojiConversionFailure` instead of generic :exc:`.BadArgument`
@@ -870,6 +872,14 @@ class PartialEmojiConverter(Converter[discord.PartialEmoji]):
                 animated=emoji_animated,
                 name=emoji_name,
                 id=emoji_id,
+            )
+
+        if argument in UNICODE_EMOJIS:
+            return discord.PartialEmoji.with_state(
+                ctx.bot._connection,
+                animated=False,
+                name=argument,
+                id=None,
             )
 
         raise PartialEmojiConversionFailure(argument)
@@ -1094,7 +1104,11 @@ _GenericAlias = type(List[T])
 
 
 def is_generic_type(tp: Any, *, _GenericAlias: type = _GenericAlias) -> bool:
-    return isinstance(tp, type) and issubclass(tp, Generic) or isinstance(tp, _GenericAlias)  # type: ignore
+    return (
+        isinstance(tp, type)
+        and issubclass(tp, Generic)
+        or isinstance(tp, _GenericAlias)
+    )  # type: ignore
 
 
 CONVERTER_MAPPING: dict[type[Any], Any] = {
@@ -1111,7 +1125,7 @@ CONVERTER_MAPPING: dict[type[Any], Any] = {
     discord.Colour: ColourConverter,
     discord.VoiceChannel: VoiceChannelConverter,
     discord.StageChannel: StageChannelConverter,
-    discord.Emoji: EmojiConverter,
+    discord.GuildEmoji: EmojiConverter,
     discord.PartialEmoji: PartialEmojiConverter,
     discord.CategoryChannel: CategoryChannelConverter,
     discord.ForumChannel: ForumChannelConverter,

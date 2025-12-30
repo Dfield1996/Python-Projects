@@ -27,9 +27,11 @@ from __future__ import annotations
 
 from typing import Literal, Union
 
-from .._typed_dict import NotRequired, TypedDict
+from typing_extensions import NotRequired, TypedDict
+
 from ..enums import SortOrder
 from ..flags import ChannelFlags
+from .emoji import PartialEmoji
 from .snowflake import Snowflake
 from .threads import ThreadArchiveDuration, ThreadMember, ThreadMetadata
 from .user import User
@@ -44,7 +46,7 @@ class PermissionOverwrite(TypedDict):
     deny: str
 
 
-ChannelType = Literal[0, 1, 2, 3, 4, 5, 10, 11, 12, 13]
+ChannelType = Literal[0, 1, 2, 3, 4, 5, 10, 11, 12, 13, 14, 15, 16]
 
 
 class _BaseChannel(TypedDict):
@@ -181,3 +183,14 @@ class StageInstance(TypedDict):
     privacy_level: PrivacyLevel
     discoverable_disabled: bool
     guild_scheduled_event_id: Snowflake
+
+
+class VoiceChannelEffectSendEvent(TypedDict):
+    channel_id: Snowflake
+    guild_id: Snowflake
+    user_id: Snowflake
+    emoji: NotRequired[PartialEmoji | None]
+    animation_type: NotRequired[int | None]
+    animation_id: NotRequired[int]
+    sound_id: NotRequired[Snowflake | int]
+    sound_volume: NotRequired[float]

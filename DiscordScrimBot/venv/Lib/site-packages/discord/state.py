@@ -49,7 +49,7 @@ from .audit_logs import AuditLogEntry
 from .automod import AutoModRule
 from .channel import *
 from .channel import _channel_factory
-from .emoji import Emoji
+from .emoji import AppEmoji, GuildEmoji
 from .enums import ChannelType, InteractionType, ScheduledEventStatus, Status, try_enum
 from .flags import ApplicationFlags, Intents, MemberCacheFlags
 from .guild import Guild
@@ -59,18 +59,19 @@ from .invite import Invite
 from .member import Member
 from .mentions import AllowedMentions
 from .message import Message
-from .monetization import Entitlement
+from .monetization import Entitlement, Subscription
 from .object import Object
 from .partial_emoji import PartialEmoji
 from .poll import Poll, PollAnswerCount
 from .raw_models import *
 from .role import Role
 from .scheduled_events import ScheduledEvent
+from .soundboard import PartialSoundboardSound, SoundboardSound
 from .stage_instance import StageInstance
 from .sticker import GuildSticker
 from .threads import Thread, ThreadMember
 from .ui.modal import Modal, ModalStore
-from .ui.view import View, ViewStore
+from .ui.view import BaseView, ViewStore
 from .user import ClientUser, User
 
 if TYPE_CHECKING:
@@ -251,6 +252,8 @@ class ConnectionState:
             self.store_user = self.create_user  # type: ignore
             self.deref_user = self.deref_user_no_intents  # type: ignore
 
+        self.cache_app_emojis: bool = options.get("cache_app_emojis", False)
+
         self.parsers = parsers = {}
         for attr, func in inspect.getmembers(self):
             if attr.startswith("parse_"):
@@ -273,7 +276,7 @@ class ConnectionState:
         # using __del__. Testing this for memory leaks led to no discernible leaks,
         # though more testing will have to be done.
         self._users: dict[int, User] = {}
-        self._emojis: dict[int, Emoji] = {}
+        self._emojis: dict[int, (GuildEmoji, AppEmoji)] = {}
         self._stickers: dict[int, GuildSticker] = {}
         self._guilds: dict[int, Guild] = {}
         self._polls: dict[int, Poll] = {}
@@ -281,6 +284,7 @@ class ConnectionState:
             self._view_store: ViewStore = ViewStore(self)
         self._modal_store: ModalStore = ModalStore(self)
         self._voice_clients: dict[int, VoiceClient] = {}
+        self._sounds: dict[int, SoundboardSound] = {}
 
         # LRU of max size 128
         self._private_channels: OrderedDict[int, PrivateChannel] = OrderedDict()
@@ -353,13 +357,21 @@ class ConnectionState:
     def store_user(self, data: UserPayload) -> User:
         user_id = int(data["id"])
         try:
-            return self._users[user_id]
+            user = self._users[user_id]
         except KeyError:
             user = User(state=self, data=data)
             if user.discriminator != "0000":
                 self._users[user_id] = user
                 user._stored = True
             return user
+        else:
+            # Making sure we don't mutate the cached user
+            # because we cannot make sure it's up to date.
+            # but still return the updated version of the user.
+            # This make sure data like banner, etc are updated.
+            copied_user = user._copy(user)
+            copied_user._update(data)
+            return copied_user
 
     def deref_user(self, user_id: int) -> None:
         self._users.pop(user_id, None)
@@ -374,10 +386,20 @@ class ConnectionState:
         # the keys of self._users are ints
         return self._users.get(id)  # type: ignore
 
-    def store_emoji(self, guild: Guild, data: EmojiPayload) -> Emoji:
+    def store_emoji(self, guild: Guild, data: EmojiPayload) -> GuildEmoji:
         # the id will be present here
         emoji_id = int(data["id"])  # type: ignore
-        self._emojis[emoji_id] = emoji = Emoji(guild=guild, state=self, data=data)
+        self._emojis[emoji_id] = emoji = GuildEmoji(guild=guild, state=self, data=data)
+        return emoji
+
+    def maybe_store_app_emoji(
+        self, application_id: int, data: EmojiPayload
+    ) -> AppEmoji:
+        # the id will be present here
+        emoji = AppEmoji(application_id=application_id, state=self, data=data)
+        if self.cache_app_emojis:
+            emoji_id = int(data["id"])  # type: ignore
+            self._emojis[emoji_id] = emoji
         return emoji
 
     def store_sticker(self, guild: Guild, data: GuildStickerPayload) -> GuildSticker:
@@ -385,17 +407,20 @@ class ConnectionState:
         self._stickers[sticker_id] = sticker = GuildSticker(state=self, data=data)
         return sticker
 
-    def store_view(self, view: View, message_id: int | None = None) -> None:
+    def store_view(self, view: BaseView, message_id: int | None = None) -> None:
         self._view_store.add_view(view, message_id)
+
+    def purge_message_view(self, message_id: int) -> None:
+        self._view_store.remove_message_view(message_id)
 
     def store_modal(self, modal: Modal, message_id: int) -> None:
         self._modal_store.add_modal(modal, message_id)
 
-    def prevent_view_updates_for(self, message_id: int) -> View | None:
+    def prevent_view_updates_for(self, message_id: int) -> BaseView | None:
         return self._view_store.remove_message_tracking(message_id)
 
     @property
-    def persistent_views(self) -> Sequence[View]:
+    def persistent_views(self) -> Sequence[BaseView]:
         return self._view_store.persistent_views
 
     @property
@@ -413,7 +438,7 @@ class ConnectionState:
         self._guilds.pop(guild.id, None)
 
         for emoji in guild.emojis:
-            self._emojis.pop(emoji.id, None)
+            self._remove_emoji(emoji)
 
         for sticker in guild.stickers:
             self._stickers.pop(sticker.id, None)
@@ -421,16 +446,19 @@ class ConnectionState:
         del guild
 
     @property
-    def emojis(self) -> list[Emoji]:
+    def emojis(self) -> list[GuildEmoji | AppEmoji]:
         return list(self._emojis.values())
 
     @property
     def stickers(self) -> list[GuildSticker]:
         return list(self._stickers.values())
 
-    def get_emoji(self, emoji_id: int | None) -> Emoji | None:
+    def get_emoji(self, emoji_id: int | None) -> GuildEmoji | AppEmoji | None:
         # the keys of self._emojis are ints
         return self._emojis.get(emoji_id)  # type: ignore
+
+    def _remove_emoji(self, emoji: GuildEmoji | AppEmoji) -> None:
+        self._emojis.pop(emoji.id, None)
 
     def get_sticker(self, sticker_id: int | None) -> GuildSticker | None:
         # the keys of self._stickers are ints
@@ -587,6 +615,10 @@ class ConnectionState:
             raise
 
     async def _delay_ready(self) -> None:
+        if self.cache_app_emojis and self.application_id:
+            data = await self.http.get_all_application_emojis(self.application_id)
+            for e in data.get("items", []):
+                self.maybe_store_app_emoji(self.application_id, e)
         try:
             states = []
             while True:
@@ -631,6 +663,7 @@ class ConnectionState:
         except asyncio.CancelledError:
             pass
         else:
+            await self._add_default_sounds()
             # dispatch the event
             self.call_handlers("ready")
             self.dispatch("ready")
@@ -654,7 +687,9 @@ class ConnectionState:
             else:
                 self.application_id = utils._get_as_snowflake(application, "id")
                 # flags will always be present here
-                self.application_flags = ApplicationFlags._from_value(application["flags"])  # type: ignore
+                self.application_flags = ApplicationFlags._from_value(
+                    application["flags"]
+                )  # type: ignore
 
         for guild_data in data["guilds"]:
             self._add_guild_from_data(guild_data)
@@ -698,6 +733,18 @@ class ConnectionState:
         event = Entitlement(data=data, state=self)
         self.dispatch("entitlement_delete", event)
 
+    def parse_subscription_create(self, data) -> None:
+        event = Subscription(data=data, state=self)
+        self.dispatch("subscription_create", event)
+
+    def parse_subscription_update(self, data) -> None:
+        event = Subscription(data=data, state=self)
+        self.dispatch("subscription_update", event)
+
+    def parse_subscription_delete(self, data) -> None:
+        event = Subscription(data=data, state=self)
+        self.dispatch("subscription_delete", event)
+
     def parse_message_create(self, data) -> None:
         channel, _ = self._get_guild_channel(data)
         # channel would be the correct type here
@@ -740,21 +787,20 @@ class ConnectionState:
                 self._messages.remove(msg)  # type: ignore
 
     def parse_message_update(self, data) -> None:
-        raw = RawMessageUpdateEvent(data)
-        message = self._get_message(raw.message_id)
-        if message is not None:
-            older_message = copy.copy(message)
-            raw.cached_message = older_message
-            self.dispatch("raw_message_edit", raw)
-            message._update(data)
-            # Coerce the `after` parameter to take the new updated Member
-            # ref: #5999
-            older_message.author = message.author
-            self.dispatch("message_edit", older_message, message)
+        old_message = self._get_message(int(data["id"]))
+        channel, _ = self._get_guild_channel(data)
+        message = Message(channel=channel, data=data, state=self)
+        if self._messages is not None:
+            if old_message is not None:
+                self._messages.remove(old_message)
+            self._messages.append(message)
+        raw = RawMessageUpdateEvent(data, message)
+        self.dispatch("raw_message_edit", raw)
+        if old_message is not None:
+            self.dispatch("message_edit", old_message, message)
         else:
             if poll_data := data.get("poll"):
                 self.store_raw_poll(poll_data, raw)
-            self.dispatch("raw_message_edit", raw)
 
         if "components" in data and self._view_store.is_message_tracked(raw.message_id):
             self._view_store.update_from_message(raw.message_id, data["components"])
@@ -1343,7 +1389,9 @@ class ConnectionState:
         for emoji in before_stickers:
             self._stickers.pop(emoji.id, None)
         # guild won't be None here
-        guild.stickers = tuple(map(lambda d: self.store_sticker(guild, d), data["stickers"]))  # type: ignore
+        guild.stickers = tuple(
+            map(lambda d: self.store_sticker(guild, d), data["stickers"])
+        )  # type: ignore
         self.dispatch("guild_stickers_update", guild, before_stickers, guild.stickers)
 
     def _get_create_guild(self, data):
@@ -1548,7 +1596,10 @@ class ConnectionState:
         presences = data.get("presences", [])
 
         # the guild won't be None here
-        members = [Member(guild=guild, data=member, state=self) for member in data.get("members", [])]  # type: ignore
+        members = [
+            Member(guild=guild, data=member, state=self)
+            for member in data.get("members", [])
+        ]  # type: ignore
         _log.debug(
             "Processed a chunk for %s members in guild ID %s.", len(members), guild_id
         )
@@ -1932,7 +1983,7 @@ class ConnectionState:
             return channel.guild.get_member(user_id)
         return self.get_user(user_id)
 
-    def get_reaction_emoji(self, data) -> Emoji | PartialEmoji:
+    def get_reaction_emoji(self, data) -> GuildEmoji | AppEmoji | PartialEmoji:
         emoji_id = utils._get_as_snowflake(data, "id")
 
         if not emoji_id:
@@ -1948,7 +1999,9 @@ class ConnectionState:
                 name=data["name"],
             )
 
-    def _upgrade_partial_emoji(self, emoji: PartialEmoji) -> Emoji | PartialEmoji | str:
+    def _upgrade_partial_emoji(
+        self, emoji: PartialEmoji
+    ) -> GuildEmoji | AppEmoji | PartialEmoji | str:
         emoji_id = emoji.id
         if not emoji_id:
             return emoji.name
@@ -1977,6 +2030,83 @@ class ConnectionState:
         data: MessagePayload,
     ) -> Message:
         return Message(state=self, channel=channel, data=data)
+
+    def parse_voice_channel_effect_send(self, data) -> None:
+        if sound_id := int(data.get("sound_id", 0)):
+            sound = self._get_sound(sound_id)
+            if sound is None:
+                sound = PartialSoundboardSound(data, self, self.http)
+            raw = VoiceChannelEffectSendEvent(data, self, sound)
+        else:
+            raw = VoiceChannelEffectSendEvent(data, self, None)
+
+        self.dispatch("voice_channel_effect_send", raw)
+
+    def _get_sound(self, sound_id: int) -> SoundboardSound | None:
+        return self._sounds.get(sound_id)
+
+    def _update_sound(self, sound: SoundboardSound) -> SoundboardSound | None:
+        before = self._sounds.get(sound.id)
+        self._sounds[sound.id] = sound
+        return before
+
+    def parse_soundboard_sounds(self, data) -> None:
+        guild_id = int(data["guild_id"])
+        for sound_data in data["soundboard_sounds"]:
+            self._add_sound(
+                SoundboardSound(
+                    state=self, http=self.http, data=sound_data, guild_id=guild_id
+                )
+            )
+
+    def parse_guild_soundboard_sounds_update(self, data):
+        before_sounds = []
+        after_sounds = []
+        for sound_data in data["soundboard_sounds"]:
+            after = SoundboardSound(state=self, http=self.http, data=sound_data)
+            if before := self._update_sound(after):
+                before_sounds.append(before)
+            after_sounds.append(after)
+        if len(before_sounds) == len(after_sounds):
+            self.dispatch("soundboard_sounds_update", before_sounds, after_sounds)
+        self.dispatch("raw_soundboard_sounds_update", after_sounds)
+
+    def parse_guild_soundboard_sound_update(self, data):
+        after = SoundboardSound(state=self, http=self.http, data=data)
+        if before := self._update_sound(after):
+            self.dispatch("soundboard_sound_update", before, after)
+        self.dispatch("raw_soundboard_sound_update", after)
+
+    def parse_guild_soundboard_sound_create(self, data):
+        sound = SoundboardSound(state=self, http=self.http, data=data)
+        self._add_sound(sound)
+        self.dispatch("soundboard_sound_create", sound)
+
+    def parse_guild_soundboard_sound_delete(self, data):
+        sound_id = int(data["sound_id"])
+        sound = self._get_sound(sound_id)
+        if sound is not None:
+            self._remove_sound(sound)
+            self.dispatch("soundboard_sound_delete", sound)
+        self.dispatch(
+            "raw_soundboard_sound_delete", RawSoundboardSoundDeleteEvent(data)
+        )
+
+    async def _add_default_sounds(self) -> None:
+        default_sounds = await self.http.get_default_sounds()
+        for default_sound in default_sounds:
+            sound = SoundboardSound(state=self, http=self.http, data=default_sound)
+            self._add_sound(sound)
+
+    def _add_sound(self, sound: SoundboardSound) -> None:
+        self._sounds[sound.id] = sound
+
+    def _remove_sound(self, sound: SoundboardSound) -> None:
+        self._sounds.pop(sound.id, None)
+
+    @property
+    def sounds(self) -> list[SoundboardSound]:
+        return list(self._sounds.values())
 
 
 class AutoShardedConnectionState(ConnectionState):
@@ -2085,6 +2215,11 @@ class AutoShardedConnectionState(ConnectionState):
                     self.dispatch("guild_join", guild)
 
             self.dispatch("shard_ready", shard_id)
+
+        if self.cache_app_emojis and self.application_id:
+            data = await self.http.get_all_application_emojis(self.application_id)
+            for e in data.get("items", []):
+                self.maybe_store_app_emoji(self.application_id, e)
 
         # remove the state
         try:
